@@ -1,0 +1,5 @@
+services:
+  - type: worker
+    name: Videochat
+    env: docker
+    plan: free
