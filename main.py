@@ -1,96 +1,258 @@
 import os
-import asyncio
+import subprocess
+import time
 import threading
-from flask import Flask
+import telebot
 
-from pyrogram import Client, filters
-from pytgcalls import PyTgCalls
-from pytgcalls.types.input_stream import AudioVideoPiped
-from pytgcalls.types.input_stream.quality import HighQualityVideo
-import yt_dlp
+# ==========================================
+# TOKEN
+# ==========================================
+BOT_TOKEN = os.getenv("8706187795:AAGujjR8Dw0ri7h_yaaXwml8dfwoGY_oLBA ")
 
-# ================= CONFIG =================
-API_ID = int(os.getenv("33954704", "0"))
-API_HASH = os.getenv("e2719a9096fb9a50dad0c550ee079f28", "")
-BOT_TOKEN = os.getenv("8706187795:AAHAdPfcZWErPMDhWul_VlFknmTs-YWzDUA", "")
+if not BOT_TOKEN:
+    raise Exception("BOT_TOKEN topilmadi!")
 
-OWNER_ID = 8427195149  # sening TG ID
+bot = telebot.TeleBot(BOT_TOKEN)
 
-# ================= FLASK (24/7 KEEP ALIVE) =================
-app_web = Flask(__name__)
+# Streamlarni saqlash
+streams = {}
 
-@app_web.route("/")
-def home():
-    return "Bot is running 24/7 ⚡"
+# ==========================================
+# STREAM FUNCTION
+# ==========================================
+def run_stream(chat_id, youtube_url, server_url, stream_key):
 
-@app_web.route("/ping")
-def ping():
-    return "ok"
+    rtmp_url = f"{server_url}{stream_key}"
 
-# ================= USERBOT =================
-userbot = Client("userbot", api_id=API_ID, api_hash=API_HASH)
-vc = PyTgCalls(userbot)
+    while streams.get(chat_id, {}).get("active", False):
 
-def get_stream(url):
-    ydl_opts = {"format": "best"}
-    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-        info = ydl.extract_info(url, download=False)
-        return info["url"]
+        try:
+            bot.send_message(chat_id, "🔄 YouTube stream link olinmoqda...")
 
-@userbot.on_message(filters.command("vplay"))
-async def vplay(_, msg):
-    if len(msg.command) < 2:
-        return await msg.reply("❌ YouTube link yubor")
+            # Direct video URL olish
+            get_url_cmd = [
+                "yt-dlp",
+                "-g",
+                "-f",
+                "best[height<=720]",
+                youtube_url
+            ]
 
-    url = msg.command[1]
-    stream_url = get_stream(url)
+            result = subprocess.run(
+                get_url_cmd,
+                capture_output=True,
+                text=True
+            )
 
-    await vc.join_group_call(
-        msg.chat.id,
-        AudioVideoPiped(
-            stream_url,
-            video_parameters=HighQualityVideo()
+            if result.returncode != 0:
+                bot.send_message(
+                    chat_id,
+                    f"❌ yt-dlp xatolik:\n{result.stderr[:300]}"
+                )
+                time.sleep(15)
+                continue
+
+            video_url = result.stdout.strip()
+
+            bot.send_message(chat_id, "🚀 Stream boshlandi!")
+
+            ffmpeg_cmd = [
+                "ffmpeg",
+                "-re",
+                "-i", video_url,
+
+                "-c:v", "libx264",
+                "-preset", "veryfast",
+                "-maxrate", "2500k",
+                "-bufsize", "5000k",
+                "-pix_fmt", "yuv420p",
+                "-g", "50",
+
+                "-c:a", "aac",
+                "-b:a", "128k",
+                "-ar", "44100",
+
+                "-f", "flv",
+                rtmp_url
+            ]
+
+            process = subprocess.Popen(
+                ffmpeg_cmd,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT
+            )
+
+            streams[chat_id]["process"] = process
+
+            process.wait()
+
+            if streams.get(chat_id, {}).get("active", False):
+                bot.send_message(
+                    chat_id,
+                    "⚠️ Stream uzildi.\n🔁 10 soniyadan keyin qayta ulanadi..."
+                )
+                time.sleep(10)
+
+        except Exception as e:
+            bot.send_message(chat_id, f"❌ Xatolik:\n{e}")
+            time.sleep(10)
+
+# ==========================================
+# START
+# ==========================================
+@bot.message_handler(commands=['start', 'help'])
+def start(message):
+
+    text = (
+        "👋 Salom!\n\n"
+        "Men YouTube videolarini Telegram Live Stream ga uzatuvchi botman.\n\n"
+        "📌 Buyruqlar:\n"
+        "/stream - Yangi stream boshlash\n"
+        "/stop - Streamni to'xtatish\n"
+        "/status - Holatni tekshirish"
+    )
+
+    bot.reply_to(message, text)
+
+# ==========================================
+# STREAM START
+# ==========================================
+@bot.message_handler(commands=['stream'])
+def stream(message):
+
+    msg = bot.send_message(
+        message.chat.id,
+        "🔗 YouTube video link yuboring:"
+    )
+
+    bot.register_next_step_handler(msg, get_youtube)
+
+# ==========================================
+# GET YOUTUBE
+# ==========================================
+def get_youtube(message):
+
+    youtube_url = message.text.strip()
+
+    msg = bot.send_message(
+        message.chat.id,
+        "🌐 RTMP Server URL yuboring:\n\nMasalan:\nrtmps://dc4-1.rtmp.t.me/s/"
+    )
+
+    bot.register_next_step_handler(
+        msg,
+        get_server,
+        youtube_url
+    )
+
+# ==========================================
+# GET SERVER
+# ==========================================
+def get_server(message, youtube_url):
+
+    server_url = message.text.strip()
+
+    msg = bot.send_message(
+        message.chat.id,
+        "🔑 Stream Key yuboring:"
+    )
+
+    bot.register_next_step_handler(
+        msg,
+        start_stream,
+        youtube_url,
+        server_url
+    )
+
+# ==========================================
+# START FINAL STREAM
+# ==========================================
+def start_stream(message, youtube_url, server_url):
+
+    stream_key = message.text.strip()
+
+    chat_id = message.chat.id
+
+    if chat_id in streams and streams[chat_id].get("active"):
+
+        bot.send_message(
+            chat_id,
+            "⚠️ Sizda allaqachon stream ishlayapti."
+        )
+
+        return
+
+    streams[chat_id] = {
+        "active": True,
+        "youtube": youtube_url
+    }
+
+    thread = threading.Thread(
+        target=run_stream,
+        args=(
+            chat_id,
+            youtube_url,
+            server_url,
+            stream_key
         )
     )
 
-    await msg.reply("▶️ Stream boshlandi")
+    thread.start()
 
-@userbot.on_message(filters.command("stop"))
-async def stop(_, msg):
-    try:
-        await vc.leave_group_call(msg.chat.id)
-        await msg.reply("⏹ To‘xtatildi")
-    except:
-        await msg.reply("❌ Active stream yo‘q")
+# ==========================================
+# STOP STREAM
+# ==========================================
+@bot.message_handler(commands=['stop'])
+def stop(message):
 
-def run_userbot():
-    userbot.start()
-    vc.start()
-    print("USERBOT 24/7 RUNNING")
-    userbot.idle()
+    chat_id = message.chat.id
 
-# ================= BOT =================
-bot = Client("bot", bot_token=BOT_TOKEN)
+    if chat_id not in streams:
 
-@bot.on_message(filters.command("vplay"))
-async def bot_vplay(_, msg):
-    if msg.from_user.id != OWNER_ID:
-        return await msg.reply("❌ Sizga ruxsat yo‘q")
+        bot.send_message(
+            chat_id,
+            "❌ Sizda faol stream yo'q."
+        )
 
-    await msg.reply("▶️ Stream boshlash userbotga yuborildi")
+        return
 
-@bot.on_message(filters.command("stop"))
-async def bot_stop(_, msg):
-    if msg.from_user.id != OWNER_ID:
-        return await msg.reply("❌ Sizga ruxsat yo‘q")
+    streams[chat_id]["active"] = False
 
-    await msg.reply("⏹ Stop yuborildi userbotga")
+    process = streams[chat_id].get("process")
 
-def run_bot():
-    bot.run()
+    if process:
+        process.terminate()
 
-# ================= START EVERYTHING =================
-if __name__ == "__main__":
-    threading.Thread(target=run_userbot).start()
-    threading.Thread(target=run_bot).start()
-    app_web.run(host="0.0.0.0", port=10000)
+    bot.send_message(
+        chat_id,
+        "🛑 Stream to'xtatildi."
+    )
+
+# ==========================================
+# STATUS
+# ==========================================
+@bot.message_handler(commands=['status'])
+def status(message):
+
+    chat_id = message.chat.id
+
+    if chat_id in streams and streams[chat_id].get("active"):
+
+        bot.send_message(
+            chat_id,
+            f"✅ Stream ishlayapti:\n{streams[chat_id]['youtube']}"
+        )
+
+    else:
+
+        bot.send_message(
+            chat_id,
+            "❌ Hozir stream yo'q."
+        )
+
+# ==========================================
+# RUN
+# ==========================================
+print("✅ Bot ishga tushdi...")
+
+bot.infinity_polling(skip_pending=True)
