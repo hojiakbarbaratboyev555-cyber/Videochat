@@ -9,9 +9,6 @@ import telebot
 # ==========================================
 BOT_TOKEN = os.getenv("8706187795:AAGujjR8Dw0ri7h_yaaXwml8dfwoGY_oLBA ")
 
-if not BOT_TOKEN:
-    raise Exception("BOT_TOKEN topilmadi!")
-
 bot = telebot.TeleBot(BOT_TOKEN)
 
 # Streamlarni saqlash
