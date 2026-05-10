@@ -7,7 +7,7 @@ import telebot
 # ==========================================
 # TOKEN
 # ==========================================
-BOT_TOKEN = os.getenv("8706187795:AAGujjR8Dw0ri7h_yaaXwml8dfwoGY_oLBA ")
+BOT_TOKEN = os.getenv("8706187795:AAGujjR8Dw0ri7h_yaaXwml8dfwoGY_oLBA")
 
 bot = telebot.TeleBot(BOT_TOKEN)
 
