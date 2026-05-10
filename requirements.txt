@@ -1,5 +1,2 @@
-git+https://github.com/pytgcalls/pytgcalls.git
-Pyrogram==2.0.106
-TgCrypto
+pyTelegramBotAPI==4.28.0
 yt-dlp
-Flask
