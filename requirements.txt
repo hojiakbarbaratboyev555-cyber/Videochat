@@ -1,5 +1,5 @@
-pyrogram==2.0.106
-tgcrypto
-pytgcalls==3.0.0.dev24
+git+https://github.com/pytgcalls/pytgcalls.git
+Pyrogram==2.0.106
+TgCrypto
 yt-dlp
-flask
+Flask
