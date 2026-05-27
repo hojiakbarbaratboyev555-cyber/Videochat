@@ -1,5 +1,7 @@
 services:
-  - type: worker
-    name: Videochat
-    env: docker
+  - type: web
+    name: Videobot
+    env: python
+    buildCommand: "pip install -r requirements.txt"
+    startCommand: "python maf.py"
     plan: free
