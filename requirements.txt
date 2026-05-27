@@ -1,2 +1,3 @@
-pyTelegramBotAPI==4.28.0
-yt-dlp
+aiogram>=3.4
+fastapi
+uvicorn
