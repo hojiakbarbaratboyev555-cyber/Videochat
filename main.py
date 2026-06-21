@@ -13,7 +13,7 @@ import uvicorn
 # SOZLAMALAR
 # =========================
 
-BOT_TOKEN = "8765242703:AAFQfTqb9G5dncCQ_SRbyRR9BGz7QX11SGA"
+BOT_TOKEN = "8765242703:AAFkZV5GVGgrxI16diaShh-NxjVG2VOXnNQ"
 
 WEBHOOK_HOST = "https://videochat-94k9.onrender.com"
 WEBHOOK_PATH = f"/webhook/{BOT_TOKEN}"
