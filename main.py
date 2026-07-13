@@ -13,7 +13,7 @@ import uvicorn
 # SOZLAMALAR
 # =========================
 
-BOT_TOKEN = os.environ["8663105105:AAG9m4SAu8BJg7cByJFJHtqoVHRZQ_xr7Lw"]  # Render'da Environment Variable sifatida qo'shing
+BOT_TOKEN = "8663105105:AAG9m4SAu8BJg7cByJFJHtqoVHRZQ_xr7Lw"  # Render'da Environment Variable sifatida qo'shing
 
 WEBHOOK_HOST = "https://videochat-94k9.onrender.com"
 WEBHOOK_PATH = f"/webhook/{BOT_TOKEN}"
