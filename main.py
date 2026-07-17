@@ -1,7 +1,7 @@
-import json
 import logging
 import os
 
+import asyncpg
 from aiogram import Bot, Dispatcher, F, types
 from aiogram.filters import Command
 from aiogram.types import Update
@@ -13,7 +13,8 @@ import uvicorn
 # SOZLAMALAR
 # =========================
 
-BOT_TOKEN = "8663105105:AAG9m4SAu8BJg7cByJFJHtqoVHRZQ_xr7Lw"  # Render'da Environment Variable sifatida qo'shing
+BOT_TOKEN = "8663105105:AAETQnNHSufqKuUltEUiX9LjX1Ke-BzA7nM"
+DATABASE_URL = "postgresql://hotira_user:T43Mnsk2LeOXXLvAdbEIJkxlhKCnjSOG@dpg-d9cug6r7uimc73f49o9g-a/hotira"
 
 WEBHOOK_HOST = "https://videochat-94k9.onrender.com"
 WEBHOOK_PATH = f"/webhook/{BOT_TOKEN}"
@@ -23,8 +24,6 @@ ADMIN_GROUP_ID = -1004456580624   # Forum (mavzuli) guruh, bot admin bo'lishi sh
 MAIN_GROUP_ID = -1003680334929
 
 MAIN_TOPIC_NAME = "📢 Asosiy guruh"
-
-DB_FILE = "messages.json"
 
 PORT = int(os.environ.get("PORT", 10000))
 
@@ -43,94 +42,149 @@ bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher()
 
 # =========================
-# DATABASE
+# DATABASE (PostgreSQL)
 # =========================
-# Struktura:
-# {
-#   "user_topics": {"<user_id>": topic_id},
-#   "topic_users": {"<topic_id>": user_id},
-#   "messages": {"<admin_msg_id>": {"user_id": ..., "user_msg_id": ...}},
-#   "main_topic_id": topic_id
-# }
 
-def load_db():
-    if os.path.exists(DB_FILE):
-        try:
-            with open(DB_FILE, "r") as f:
-                return json.load(f)
-        except Exception as e:
-            logger.exception("DB o'qishda xatolik: %s", e)
-            return {}
-    return {}
+db_pool: asyncpg.Pool | None = None
 
-def save_db(data):
-    with open(DB_FILE, "w") as f:
-        json.dump(data, f, indent=4)
+async def init_db():
+    global db_pool
+    db_pool = await asyncpg.create_pool(DATABASE_URL, min_size=1, max_size=5)
 
-def save_message(admin_msg_id, user_id, user_msg_id):
-    data = load_db()
-    data.setdefault("messages", {})
-    data["messages"][str(admin_msg_id)] = {
-        "user_id": user_id,
-        "user_msg_id": user_msg_id
-    }
-    save_db(data)
+    async with db_pool.acquire() as conn:
+        await conn.execute("""
+            CREATE TABLE IF NOT EXISTS user_topics (
+                user_id BIGINT PRIMARY KEY,
+                topic_id BIGINT UNIQUE NOT NULL
+            )
+        """)
+        await conn.execute("""
+            CREATE TABLE IF NOT EXISTS messages (
+                admin_msg_id BIGINT PRIMARY KEY,
+                user_id BIGINT NOT NULL,
+                user_msg_id BIGINT NOT NULL
+            )
+        """)
+        await conn.execute("""
+            CREATE TABLE IF NOT EXISTS settings (
+                key TEXT PRIMARY KEY,
+                value TEXT
+            )
+        """)
 
-def get_message(admin_msg_id):
-    data = load_db()
-    return data.get("messages", {}).get(str(admin_msg_id))
+async def close_db():
+    if db_pool:
+        await db_pool.close()
 
-def get_user_topic(user_id):
-    data = load_db()
-    return data.get("user_topics", {}).get(str(user_id))
+# --- messages ---
 
-def save_user_topic(user_id, topic_id):
-    data = load_db()
-    data.setdefault("user_topics", {})[str(user_id)] = topic_id
-    data.setdefault("topic_users", {})[str(topic_id)] = user_id
-    save_db(data)
+async def save_message(admin_msg_id: int, user_id: int, user_msg_id: int):
+    async with db_pool.acquire() as conn:
+        await conn.execute(
+            """
+            INSERT INTO messages (admin_msg_id, user_id, user_msg_id)
+            VALUES ($1, $2, $3)
+            ON CONFLICT (admin_msg_id) DO UPDATE
+            SET user_id = EXCLUDED.user_id, user_msg_id = EXCLUDED.user_msg_id
+            """,
+            admin_msg_id, user_id, user_msg_id
+        )
 
-def get_topic_user(topic_id):
-    data = load_db()
-    return data.get("topic_users", {}).get(str(topic_id))
+async def get_message(admin_msg_id: int):
+    async with db_pool.acquire() as conn:
+        row = await conn.fetchrow(
+            "SELECT user_id, user_msg_id FROM messages WHERE admin_msg_id = $1",
+            admin_msg_id
+        )
+        return dict(row) if row else None
 
-def get_main_topic_id():
-    data = load_db()
-    return data.get("main_topic_id")
+# --- user_topics ---
 
-def save_main_topic_id(topic_id):
-    data = load_db()
-    data["main_topic_id"] = topic_id
-    save_db(data)
+async def get_user_topic(user_id: int):
+    async with db_pool.acquire() as conn:
+        row = await conn.fetchrow(
+            "SELECT topic_id FROM user_topics WHERE user_id = $1", user_id
+        )
+        return row["topic_id"] if row else None
+
+async def get_topic_user(topic_id: int):
+    async with db_pool.acquire() as conn:
+        row = await conn.fetchrow(
+            "SELECT user_id FROM user_topics WHERE topic_id = $1", topic_id
+        )
+        return row["user_id"] if row else None
+
+async def save_user_topic(user_id: int, topic_id: int):
+    async with db_pool.acquire() as conn:
+        await conn.execute(
+            """
+            INSERT INTO user_topics (user_id, topic_id)
+            VALUES ($1, $2)
+            ON CONFLICT (user_id) DO UPDATE SET topic_id = EXCLUDED.topic_id
+            """,
+            user_id, topic_id
+        )
+
+# --- settings (main_topic_id) ---
+
+async def get_main_topic_id():
+    async with db_pool.acquire() as conn:
+        row = await conn.fetchrow(
+            "SELECT value FROM settings WHERE key = 'main_topic_id'"
+        )
+        return int(row["value"]) if row else None
+
+async def save_main_topic_id(topic_id: int):
+    async with db_pool.acquire() as conn:
+        await conn.execute(
+            """
+            INSERT INTO settings (key, value)
+            VALUES ('main_topic_id', $1)
+            ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value
+            """,
+            str(topic_id)
+        )
 
 # =========================
 # YORDAMCHI FUNKSIYALAR
 # =========================
 
+# Bir vaqtda bir xil foydalanuvchi uchun ikkita topic ochilib ketmasligi uchun qulf
+_topic_creation_lock = None
+
 async def get_or_create_user_topic(user: types.User) -> int:
-    """Foydalanuvchi uchun mavzuni topadi, bo'lmasa yangi yaratadi."""
-    existing = get_user_topic(user.id)
+    global _topic_creation_lock
+    if _topic_creation_lock is None:
+        import asyncio
+        _topic_creation_lock = asyncio.Lock()
+
+    existing = await get_user_topic(user.id)
     if existing:
         return existing
 
-    name = user.full_name or (f"@{user.username}" if user.username else f"User {user.id}")
+    async with _topic_creation_lock:
+        # Qulf ichida yana tekshiramiz (boshqa so'rov ulgurgan bo'lishi mumkin)
+        existing = await get_user_topic(user.id)
+        if existing:
+            return existing
 
-    topic = await bot.create_forum_topic(chat_id=ADMIN_GROUP_ID, name=name)
-    topic_id = topic.message_thread_id
+        name = user.full_name or (f"@{user.username}" if user.username else f"User {user.id}")
 
-    save_user_topic(user.id, topic_id)
-    return topic_id
+        topic = await bot.create_forum_topic(chat_id=ADMIN_GROUP_ID, name=name)
+        topic_id = topic.message_thread_id
+
+        await save_user_topic(user.id, topic_id)
+        return topic_id
 
 async def get_or_create_main_topic() -> int:
-    """'Asosiy guruh' mavzusini topadi, bo'lmasa yaratadi."""
-    existing = get_main_topic_id()
+    existing = await get_main_topic_id()
     if existing:
         return existing
 
     topic = await bot.create_forum_topic(chat_id=ADMIN_GROUP_ID, name=MAIN_TOPIC_NAME)
     topic_id = topic.message_thread_id
 
-    save_main_topic_id(topic_id)
+    await save_main_topic_id(topic_id)
     return topic_id
 
 # =========================
@@ -155,7 +209,7 @@ async def user_message(message: types.Message):
         message_thread_id=topic_id
     )
 
-    save_message(
+    await save_message(
         forwarded.message_id,
         message.from_user.id,
         message.message_id
@@ -169,7 +223,7 @@ async def user_message(message: types.Message):
 async def admin_handler(message: types.Message):
 
     thread_id = message.message_thread_id
-    main_topic_id = get_main_topic_id()
+    main_topic_id = await get_main_topic_id()
 
     logger.info(
         "ADMIN_HANDLER: thread_id=%s main_topic_id=%s from=%s text=%s",
@@ -177,7 +231,6 @@ async def admin_handler(message: types.Message):
     )
 
     if thread_id is None:
-        # Umumiy (General) bo'limga yozilgan xabarlarni e'tiborsiz qoldiramiz
         logger.info("ADMIN_HANDLER: thread_id yo'q, chiqib ketyapmiz")
         return
 
@@ -195,7 +248,7 @@ async def admin_handler(message: types.Message):
     # =====================
     # Foydalanuvchi mavzusi -> foydalanuvchiga
     # =====================
-    user_id = get_topic_user(thread_id)
+    user_id = await get_topic_user(thread_id)
     logger.info("ADMIN_HANDLER: topilgan user_id=%s", user_id)
 
     if not user_id:
@@ -205,7 +258,7 @@ async def admin_handler(message: types.Message):
     reply_to_user_msg_id = None
 
     if message.reply_to_message:
-        data = get_message(message.reply_to_message.message_id)
+        data = await get_message(message.reply_to_message.message_id)
         logger.info("ADMIN_HANDLER: reply_to_message_id=%s -> data=%s",
                      message.reply_to_message.message_id, data)
         if data:
@@ -228,17 +281,13 @@ app = FastAPI()
 
 @app.on_event("startup")
 async def startup():
+    await init_db()
     await bot.set_webhook(WEBHOOK_URL)
+    await get_or_create_main_topic()
 
-    try:
-        await get_or_create_main_topic()
-    except Exception as e:
-        logger.error(
-            "Asosiy guruh mavzusini yaratib bo'lmadi. "
-            "ADMIN_GROUP_ID to'g'riligini, guruhda Topics yoqilganligini "
-            "va bot admin/'Manage Topics' huquqiga egaligini tekshiring. Xato: %s",
-            e
-        )
+@app.on_event("shutdown")
+async def shutdown():
+    await close_db()
 
 @app.post(WEBHOOK_PATH)
 async def webhook(request: Request):
