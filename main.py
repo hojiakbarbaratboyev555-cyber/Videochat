@@ -4,7 +4,7 @@ import os
 import asyncpg
 from aiogram import Bot, Dispatcher, F, types
 from aiogram.filters import Command
-from aiogram.types import Update
+from aiogram.types import Update, ChatJoinRequest, ChatMemberUpdated
 
 from fastapi import FastAPI, Request
 import uvicorn
@@ -24,6 +24,10 @@ ADMIN_GROUP_ID = -1004456580624   # Forum (mavzuli) guruh, bot admin bo'lishi sh
 MAIN_GROUP_ID = -1003680334929
 
 MAIN_TOPIC_NAME = "📢 Asosiy guruh"
+
+# /link buyrug'ini yuborganda BARCHA foydalanuvchilarning ma'lumotini
+# ko'ra oladigan super-admin(lar)
+SUPER_ADMIN_IDS = {8638979973}
 
 PORT = int(os.environ.get("PORT", 10000))
 
@@ -69,6 +73,26 @@ async def init_db():
             CREATE TABLE IF NOT EXISTS settings (
                 key TEXT PRIMARY KEY,
                 value TEXT
+            )
+        """)
+        # --- /link funksiyasi uchun jadvallar ---
+        await conn.execute("""
+            CREATE TABLE IF NOT EXISTS invite_links (
+                user_id BIGINT PRIMARY KEY,
+                invite_link TEXT UNIQUE NOT NULL,
+                full_name TEXT,
+                username TEXT,
+                created_at TIMESTAMP DEFAULT NOW()
+            )
+        """)
+        await conn.execute("""
+            CREATE TABLE IF NOT EXISTS join_requests (
+                id SERIAL PRIMARY KEY,
+                link_owner_id BIGINT NOT NULL,
+                requester_id BIGINT NOT NULL,
+                status TEXT NOT NULL DEFAULT 'pending',
+                created_at TIMESTAMP DEFAULT NOW(),
+                UNIQUE (link_owner_id, requester_id)
             )
         """)
 
@@ -145,6 +169,74 @@ async def save_main_topic_id(topic_id: int):
             str(topic_id)
         )
 
+# --- invite_links / join_requests ---
+
+async def get_user_invite_link(user_id: int):
+    async with db_pool.acquire() as conn:
+        row = await conn.fetchrow(
+            "SELECT invite_link FROM invite_links WHERE user_id = $1", user_id
+        )
+        return row["invite_link"] if row else None
+
+async def save_user_invite_link(user_id: int, invite_link: str, full_name: str, username: str | None):
+    async with db_pool.acquire() as conn:
+        await conn.execute(
+            """
+            INSERT INTO invite_links (user_id, invite_link, full_name, username)
+            VALUES ($1, $2, $3, $4)
+            ON CONFLICT (user_id) DO UPDATE
+            SET full_name = EXCLUDED.full_name, username = EXCLUDED.username
+            """,
+            user_id, invite_link, full_name, username
+        )
+
+async def get_link_owner(invite_link: str):
+    async with db_pool.acquire() as conn:
+        row = await conn.fetchrow(
+            "SELECT user_id FROM invite_links WHERE invite_link = $1", invite_link
+        )
+        return row["user_id"] if row else None
+
+async def add_join_request(link_owner_id: int, requester_id: int):
+    async with db_pool.acquire() as conn:
+        await conn.execute(
+            """
+            INSERT INTO join_requests (link_owner_id, requester_id, status)
+            VALUES ($1, $2, 'pending')
+            ON CONFLICT (link_owner_id, requester_id) DO UPDATE SET status = 'pending'
+            """,
+            link_owner_id, requester_id
+        )
+
+async def mark_join_request_approved(requester_id: int):
+    async with db_pool.acquire() as conn:
+        await conn.execute(
+            """
+            UPDATE join_requests SET status = 'approved'
+            WHERE requester_id = $1 AND status = 'pending'
+            """,
+            requester_id
+        )
+
+async def get_link_stats(link_owner_id: int):
+    async with db_pool.acquire() as conn:
+        approved = await conn.fetchval(
+            "SELECT COUNT(*) FROM join_requests WHERE link_owner_id = $1 AND status = 'approved'",
+            link_owner_id
+        )
+        pending = await conn.fetchval(
+            "SELECT COUNT(*) FROM join_requests WHERE link_owner_id = $1 AND status = 'pending'",
+            link_owner_id
+        )
+        return approved, pending
+
+async def get_all_invite_links():
+    async with db_pool.acquire() as conn:
+        rows = await conn.fetch(
+            "SELECT user_id, invite_link, full_name, username FROM invite_links ORDER BY created_at"
+        )
+        return [dict(row) for row in rows]
+
 # =========================
 # YORDAMCHI FUNKSIYALAR
 # =========================
@@ -194,6 +286,120 @@ async def get_or_create_main_topic() -> int:
 @dp.message(Command("start"))
 async def start(message: types.Message):
     pass
+
+# =========================
+# /link — shaxsiy taklif havolasi
+# =========================
+
+_link_creation_lock = None
+
+def _format_link_info(user_id: int, full_name: str | None, username: str | None,
+                       invite_link: str, approved: int, pending: int) -> str:
+    username_text = f"@{username}" if username else "yo'q"
+    return (
+        f"👤 Ism: {full_name or '-'}\n"
+        f"🔹 Username: {username_text}\n"
+        f"🆔 ID: {user_id}\n\n"
+        f"🔗 Link: {invite_link}\n"
+        f"✅ Qo'shilganlar: {approved} ta\n"
+        f"⏳ Qo'shilishi kutilayotganlar: {pending} ta"
+    )
+
+@dp.message(Command("link"), F.chat.type == "private")
+async def link_command(message: types.Message):
+    global _link_creation_lock
+    if _link_creation_lock is None:
+        import asyncio
+        _link_creation_lock = asyncio.Lock()
+
+    user = message.from_user
+
+    # --- Super-admin: barcha foydalanuvchilarning ma'lumotini ko'rsatish ---
+    if user.id in SUPER_ADMIN_IDS:
+        all_links = await get_all_invite_links()
+
+        if not all_links:
+            await message.answer("Hozircha hech kim /link buyrug'idan foydalanmagan.")
+            return
+
+        for row in all_links:
+            approved, pending = await get_link_stats(row["user_id"])
+            text = _format_link_info(
+                row["user_id"], row["full_name"], row["username"],
+                row["invite_link"], approved, pending
+            )
+            await message.answer(text)
+        return
+
+    invite_link = await get_user_invite_link(user.id)
+
+    if not invite_link:
+        async with _link_creation_lock:
+            # qulf ichida qayta tekshiramiz
+            invite_link = await get_user_invite_link(user.id)
+            if not invite_link:
+                try:
+                    link_obj = await bot.create_chat_invite_link(
+                        chat_id=MAIN_GROUP_ID,
+                        name=(user.full_name or str(user.id))[:32],
+                        creates_join_request=True,
+                    )
+                    invite_link = link_obj.invite_link
+                    await save_user_invite_link(
+                        user.id, invite_link, user.full_name, user.username
+                    )
+                except Exception as e:
+                    logger.exception("Invite link yaratishda xatolik: %s", e)
+                    await message.answer(
+                        "Havola yaratishda xatolik yuz berdi. Botga guruhda "
+                        "\"Foydalanuvchi qo'shish\" huquqi berilganini tekshiring."
+                    )
+                    return
+
+    approved, pending = await get_link_stats(user.id)
+    text = _format_link_info(
+        user.id, user.full_name, user.username, invite_link, approved, pending
+    )
+    await message.answer(text)
+
+# =========================
+# Havola orqali qo'shilish so'rovi
+# =========================
+
+@dp.chat_join_request()
+async def on_join_request(request: ChatJoinRequest):
+    if request.chat.id != MAIN_GROUP_ID:
+        return
+    if not request.invite_link:
+        return
+
+    owner_id = await get_link_owner(request.invite_link.invite_link)
+    if not owner_id:
+        return
+
+    await add_join_request(owner_id, request.from_user.id)
+    logger.info(
+        "JOIN_REQUEST: owner=%s requester=%s", owner_id, request.from_user.id
+    )
+
+# =========================
+# Admin so'rovni tasdiqlagach — a'zo bo'lib qo'shilganda
+# =========================
+
+@dp.chat_member()
+async def on_chat_member_update(event: ChatMemberUpdated):
+    if event.chat.id != MAIN_GROUP_ID:
+        return
+
+    old_status = event.old_chat_member.status
+    new_status = event.new_chat_member.status
+
+    if new_status == "member" and old_status != "member":
+        await mark_join_request_approved(event.new_chat_member.user.id)
+        logger.info(
+            "CHAT_MEMBER: user=%s guruhga qo'shildi (tasdiqlandi)",
+            event.new_chat_member.user.id
+        )
 
 # =========================
 # USER -> ADMIN GURUH (mavzuga)
@@ -282,7 +488,14 @@ app = FastAPI()
 @app.on_event("startup")
 async def startup():
     await init_db()
-    await bot.set_webhook(WEBHOOK_URL)
+    await bot.set_webhook(
+        WEBHOOK_URL,
+        allowed_updates=[
+            "message",
+            "chat_join_request",
+            "chat_member",
+        ],
+    )
     await get_or_create_main_topic()
 
 @app.on_event("shutdown")
